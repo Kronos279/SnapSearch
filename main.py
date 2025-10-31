@@ -6,6 +6,7 @@ import time
 from sentence_transformers import SentenceTransformer
 from transformers import AutoProcessor, AutoModelForCausalLM
 from preprocessing_images import renameAllImages
+from build_index import updateIndex
 
 renameAllImages()
 
@@ -127,12 +128,12 @@ for filename in os.listdir(folder_path):
     end_time = time.perf_counter()
     total_time = end_time - start_time
     print(f"Generation time: {total_time}")
-avg_time.append(total_time)
-average = sum(avg_time) / len(avg_time)
-print(average)
 
 end_all_time = time.perf_counter()
 
 
 total_time_for_all = end_all_time - start_all_time
 print("Total Time it took for everything",total_time_for_all)
+
+
+updateIndex()

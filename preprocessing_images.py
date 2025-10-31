@@ -46,7 +46,7 @@ def renameAllImages():
 
             # Rename first
             os.rename(file_path, new_path)
-            print(f"🔄 Renamed: {filename} → {new_filename}")
+            print(f"Renamed: {filename} → {new_filename}")
 
             # Convert HEIC/WEBP/PNG → JPG
             if ext in [".heic", ".webp", ".png"]:
@@ -56,10 +56,10 @@ def renameAllImages():
                     img.save(jpg_path, "JPEG", quality=95)
 
                     os.remove(new_path)
-                    print(f"✅ Converted: {new_filename} → {unique_id}.jpg")
+                    print(f" Converted: {new_filename} → {unique_id}.jpg")
 
                 except Exception as e:
-                    print(f"❌ Failed to convert {new_filename}: {e}")
+                    print(f" Failed to convert {new_filename}: {e}")
 
 
 
