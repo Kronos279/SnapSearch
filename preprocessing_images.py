@@ -17,7 +17,7 @@ from pillow_heif import register_heif_opener
 # Enable HEIC/HEIF support in Pillow
 register_heif_opener()
 
-folder_path = "/Volumes/Micron/Images"
+# folder_path = "/Volumes/Micron/Images"
 extensions = (".png", ".jpg", ".jpeg", ".webp", ".heic")
 
 # Regex to detect if a filename already follows UUID pattern
@@ -25,7 +25,7 @@ uuid_regex = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\.\w+$"
 )
 
-def renameAllImages():
+def renameAllImages(folder_path):
     for filename in os.listdir(folder_path):
         file_path = os.path.join(folder_path, filename)
 
@@ -60,8 +60,3 @@ def renameAllImages():
 
                 except Exception as e:
                     print(f" Failed to convert {new_filename}: {e}")
-
-
-
-
-

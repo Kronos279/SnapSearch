@@ -5,93 +5,102 @@ import os
 from sentence_transformers import SentenceTransformer
 
 # --- Global Constants & Model Initialization ---
-FOLDER_PATH = "/Volumes/Micron/Images"
-JSON_PATH = os.path.join(FOLDER_PATH, "captions_embeddings.json")
-INDEX_PATH = os.path.join(FOLDER_PATH, "image_index.bin")
-# This new file tracks what's IN the index
-MANIFEST_PATH = os.path.join(FOLDER_PATH, "index_manifest.json")
+# The dimension of the embeddings (all-MiniLM-L6-v2 is 384)
 EMBEDDER_DIM = 384
 
-print("Loading SentenceTransformer model...")
+# Load the sentence transformer model once when the script is imported
+# This is a global, read-only object.
+print("Loading SentenceTransformer model (for search)...")
 try:
     EMBEDDER = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
-    print("Model loaded successfully.")
+    print("Search model loaded successfully.")
 except Exception as e:
     print(f"Fatal error: Could not load model. {e}")
     EMBEDDER = None
 
-# --- Global State ---
-DATA = {}
-# This IDS list is now our "source of truth" for the index order
-IDS = []
-INDEX = None
+# --- In-Memory Cache ---
+# These globals will hold the index/data for the *currently active* folder
+# to make searching instant.
+DATA_CACHE = {}
+IDS_CACHE = []
+INDEX_CACHE = None
+CURRENT_FOLDER_LOADED = None
 
 
-# --- Helper function to load the manifest ---
-def load_manifest():
-    """Loads the list of IDs currently in the index."""
-    if not os.path.exists(MANIFEST_PATH):
-        return []
+# --- Manifest Helper Functions ---
+
+def load_manifest(folder_path: str) -> list[str]:
+    """Loads the list of indexed image IDs from a folder's manifest file."""
+    manifest_path = os.path.join(folder_path, "index_manifest.json")
+    if not os.path.exists(manifest_path):
+        return []  # No manifest, so no items are indexed
     try:
-        with open(MANIFEST_PATH, "r") as f:
-            manifest = json.load(f)
-            return manifest.get("indexed_ids", [])
+        with open(manifest_path, "r") as f:
+            data = json.load(f)
+            return data.get("indexed_ids", [])
     except Exception as e:
-        print(f"Warning: Could not read manifest file. Rebuilding index. Error: {e}")
+        print(f"Warning: Could not read manifest {manifest_path}. Error: {e}")
         return []
 
 
-# --- Helper function to save the manifest ---
-def save_manifest(ids_list):
-    """Saves the list of IDs currently in the index."""
+def save_manifest(folder_path: str, ids_list: list[str]):
+    """Saves the list of indexed image IDs to a folder's manifest file."""
+    manifest_path = os.path.join(folder_path, "index_manifest.json")
     try:
-        with open(MANIFEST_PATH, "w") as f:
+        with open(manifest_path, "w") as f:
             json.dump({"indexed_ids": ids_list}, f)
     except Exception as e:
-        print(f"Error saving manifest file: {e}")
+        print(f"Error saving manifest {manifest_path}: {e}")
 
 
-# --- Function 1: Build/Update the Index (FIXED) ---
-def updateIndex():
+# --- Main Indexing Function ---
+
+def updateIndex(folder_path: str):
     """
-    Loads embeddings from JSON and *incrementally* updates the HNSW index.
+    Checks a folder's JSON for new embeddings and incrementally updates
+    the HNSW index file (image_index.bin) for that folder.
     """
-    global DATA, IDS, INDEX, EMBEDDER_DIM, JSON_PATH, INDEX_PATH
+    global CURRENT_FOLDER_LOADED
+    print(f"Checking for index updates in: {folder_path}")
 
-    print("Checking for new items to index...")
-    try:
-        with open(JSON_PATH, "r") as f:
-            DATA = json.load(f)
-    except Exception as e:
-        print(f"Error: Could not load data from {JSON_PATH}. {e}")
+    # Define all paths relative to the specific folder
+    json_path = os.path.join(folder_path, "captions_embeddings.json")
+    index_path = os.path.join(folder_path, "image_index.bin")
+
+    if not os.path.exists(json_path):
+        print(f"Error: captions_embeddings.json not found in {folder_path}.")
         return
 
-    # 1. Find out what's new
-    all_json_ids = set(DATA.keys())
-    IDS = load_manifest()  # Load what's *already* indexed
-    indexed_ids_set = set(IDS)
+    # 1. Load the data JSON
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Error loading data for update: {e}")
+        return
 
+    # 2. Find out what's new
+    all_json_ids = set(data.keys())
+    indexed_ids = load_manifest(folder_path)  # IDs already in image_index.bin
+    indexed_ids_set = set(indexed_ids)
     new_ids_to_add = list(all_json_ids - indexed_ids_set)
 
     if not new_ids_to_add:
-        print("Index is already up-to-date. Nothing to add.")
-        # Ensure index is loaded for searching
-        if INDEX is None and os.path.exists(INDEX_PATH):
-            load_index_from_disk()
+        print(f"Index is already up-to-date for: {folder_path}")
         return
 
     print(f"Found {len(new_ids_to_add)} new items to add to the index.")
 
-    # 2. Get embeddings for *only* the new items
+    # 3. Get embeddings for *only* the new items
     new_embeddings = []
-    valid_new_ids = []
-    for i in new_ids_to_add:
-        emb = DATA[i].get("embeddings")
+    valid_new_ids = []  # IDs we are actually adding
+    for img_id in new_ids_to_add:
+        emb = data[img_id].get("embeddings")
         if emb and len(emb) == EMBEDDER_DIM:
             new_embeddings.append(emb)
-            valid_new_ids.append(i)  # Keep track of IDs we're *actually* adding
+            valid_new_ids.append(img_id)
         else:
-            print(f"Warning: Skipping new item {i} (missing or invalid embedding)")
+            print(f"Warning: Skipping item {img_id} (missing or invalid embedding)")
 
     if not valid_new_ids:
         print("No valid new items to add.")
@@ -99,110 +108,139 @@ def updateIndex():
 
     new_embeddings_np = np.array(new_embeddings, dtype="float32")
 
-    # 3. Load existing index or create a new one
-    current_num_elements = len(IDS)
+    # 4. Load existing index or create a new one
+    current_num_elements = len(indexed_ids)
     new_total_elements = current_num_elements + len(valid_new_ids)
 
-    if os.path.exists(INDEX_PATH) and current_num_elements > 0:
-        # Load the existing index to add to it
-        print(f"Loading existing index with {current_num_elements} items...")
-        if INDEX is None:
-            load_index_from_disk()
+    # Initialize the index object
+    index = hnswlib.Index(space='cosine', dim=EMBEDDER_DIM)
 
-        # Resize the index to make space for new items
-        INDEX.resize_index(new_total_elements)
+    if os.path.exists(index_path) and current_num_elements > 0:
+        # Load the existing index
+        print(f"Loading existing index with {current_num_elements} items...")
+        index.load_index(index_path, max_elements=current_num_elements)
+        # Make space for the new items
+        index.resize_index(new_total_elements)
     else:
         # Create a new index
         print(f"Creating new index for {new_total_elements} elements...")
-        INDEX = hnswlib.Index(space='cosine', dim=EMBEDDER_DIM)
-        INDEX.init_index(max_elements=new_total_elements, ef_construction=200, M=16)
+        index.init_index(max_elements=new_total_elements, ef_construction=200, M=16)
 
-    # 4. Add *only* the new items
-    # The new items will have numerical labels starting *after* the old ones
+    # 5. Add *only* the new items
+    # The new items will have numerical labels from `current_num_elements` up to `new_total_elements - 1`
     new_numerical_labels = np.arange(current_num_elements, new_total_elements)
 
     print(f"Adding {len(valid_new_ids)} new items to index...")
-    INDEX.add_items(new_embeddings_np, new_numerical_labels)
+    index.add_items(new_embeddings_np, new_numerical_labels)
 
-    # 5. Save everything
-    INDEX.save_index(INDEX_PATH)
+    # 6. Save the updated index and manifest
+    index.save_index(index_path)
 
-    # Update our master list of IDs and save it
-    IDS.extend(valid_new_ids)
-    save_manifest(IDS)
+    indexed_ids.extend(valid_new_ids)  # Add the new IDs to the master list
+    save_manifest(folder_path, indexed_ids)
 
     print(f"Indexing complete. Index saved with {new_total_elements} total items.")
 
+    # Clear the in-memory cache if it was for this folder
+    if CURRENT_FOLDER_LOADED == folder_path:
+        CURRENT_FOLDER_LOADED = None
+        global DATA_CACHE, IDS_CACHE, INDEX_CACHE
+        DATA_CACHE = {}
+        IDS_CACHE = []
+        INDEX_CACHE = None
 
-# --- Helper function to load index for searching ---
-def load_index_from_disk():
-    global INDEX, IDS, EMBEDDER_DIM, MANIFEST_PATH, INDEX_PATH
+
+# --- Search Functions ---
+
+def load_folder_into_memory(folder_path: str) -> bool:
+    """
+    Loads a specific folder's index and data files into the global cache
+    for fast, repeated searching. Your GUI should call this when a
+    user clicks on a folder.
+    """
+    global DATA_CACHE, IDS_CACHE, INDEX_CACHE, CURRENT_FOLDER_LOADED
+
+    if CURRENT_FOLDER_LOADED == folder_path:
+        print(f"'{folder_path}' is already in the cache.")
+        return True  # Already loaded
+
+    print(f"Loading '{folder_path}' into memory cache...")
+
+    # Define paths
+    json_path = os.path.join(folder_path, "captions_embeddings.json")
+    index_path = os.path.join(folder_path, "image_index.bin")
+
     try:
-        if not os.path.exists(MANIFEST_PATH):
-            print("Error: Manifest file not found. Cannot load index.")
+        # 1. Load the ID manifest
+        IDS_CACHE = load_manifest(folder_path)
+        if not IDS_CACHE:
+            print(f"Folder '{folder_path}' has no indexed items.")
+            CURRENT_FOLDER_LOADED = None  # Mark as nothing loaded
             return False
 
-        IDS = load_manifest()
-        if not IDS:
-            print("Error: No items in manifest. Cannot load index.")
-            return False
+        # 2. Load the HNSW index
+        INDEX_CACHE = hnswlib.Index(space='cosine', dim=EMBEDDER_DIM)
+        INDEX_CACHE.load_index(index_path, max_elements=len(IDS_CACHE))
 
-        print(f"Loading index with {len(IDS)} items...")
-        INDEX = hnswlib.Index(space='cosine', dim=EMBEDDER_DIM)
-        INDEX.load_index(INDEX_PATH, max_elements=len(IDS))
-        print("Index loaded successfully.")
+        # 3. Load the data JSON
+        with open(json_path, "r") as f:
+            DATA_CACHE = json.load(f)
+
+        # 4. Mark the cache as successfully loaded
+        CURRENT_FOLDER_LOADED = folder_path
+        print(f"Successfully loaded '{folder_path}' into cache ({len(IDS_CACHE)} items).")
         return True
+
     except Exception as e:
-        print(f"Error loading index: {e}")
-        INDEX = None
-        IDS = []
+        print(f"Error loading folder '{folder_path}' into cache: {e}")
+        # Reset cache on failure
+        DATA_CACHE = {}
+        IDS_CACHE = []
+        INDEX_CACHE = None
+        CURRENT_FOLDER_LOADED = None
         return False
 
 
-# --- Function 2: Search the Index (Updated) ---
 def searchSimilaritems(prompt: str) -> list[str]:
     """
-    Searches the index for a given text prompt and returns
-    a list of matching filenames.
+    Searches the *currently cached* folder for a text prompt.
+
+    Returns a list of matching filenames.
     """
-    global DATA, IDS, INDEX, EMBEDDER
+    global DATA_CACHE, IDS_CACHE, INDEX_CACHE, EMBEDDER, CURRENT_FOLDER_LOADED
 
     if EMBEDDER is None:
-        print("Error: Model is not loaded.")
+        print("Error: Search model is not loaded. Cannot perform search.")
         return []
 
-    # --- Load index if not in memory ---
-    if INDEX is None:
-        if not load_index_from_disk():
-            print("Please run 'updateIndex()' first to create the index file.")
-            return []
+    if INDEX_CACHE is None or not CURRENT_FOLDER_LOADED:
+        print("Error: No folder is loaded into memory.")
+        print("Please call 'load_folder_into_memory(folder_path)' first.")
+        return []
 
-    # --- Load data if not in memory ---
-    if not DATA:
-        try:
-            with open(JSON_PATH, "r") as f:
-                DATA = json.load(f)
-        except Exception as e:
-            print(f"Error loading data file: {e}")
-            return []
-
-    # --- Perform the Search ---
+    print(f"Searching in '{CURRENT_FOLDER_LOADED}' for: '{prompt}'")
     query_embedding = EMBEDDER.encode(prompt, normalize_embeddings=True)
     query_embedding = np.array([query_embedding], dtype="float32")
 
-    k = len(IDS)  # Search all items
-    labels, distances = INDEX.knn_query(query_embedding, k=k)
+    # Search for all neighbors
+    k = len(IDS_CACHE)
+    try:
+        labels, distances = INDEX_CACHE.knn_query(query_embedding, k=k)
+    except Exception as e:
+        print(f"Error during knn_query: {e}")
+        return []
 
     # --- Filter results ---
-    similarity_threshold = 0.26
+    similarity_threshold = 0.35
     similar_filenames = []
 
     for idx, dist in zip(labels[0], distances[0]):
         similarity = 1 - dist
         if similarity >= similarity_threshold:
-            # The numerical label 'idx' directly maps to our 'IDS' list
-            image_id = IDS[idx]
-            filename = DATA.get(image_id, {}).get("filename")
+            # The numerical label 'idx' is the position in our IDS_CACHE list
+            image_id = IDS_CACHE[idx]
+            # Get the filename from the data cache
+            filename = DATA_CACHE.get(image_id, {}).get("filename")
             if filename:
                 similar_filenames.append(filename)
             else:
@@ -211,24 +249,31 @@ def searchSimilaritems(prompt: str) -> list[str]:
     return similar_filenames
 
 
-# --- Example of how to use these functions ---
 if __name__ == "__main__":
-    # 1. Run the update function.
-    # This will check for new images and add them.
-    # If no new images, it's very fast.
-    updateIndex()
+    # You must provide a path to test
+    TEST_FOLDER = "/Volumes/Micron/Images"
+
+    # 1. First, update the index.
+    # This will find and add any new images from the JSON.
+    updateIndex(TEST_FOLDER)
 
     print("\n" + "=" * 30 + "\n")
 
-    # 2. Now you can run searches.
-    query = "a dog playing in a park"
-    print(f"Searching for: '{query}'")
+    # 2. Next, load that folder into memory for searching.
+    if load_folder_into_memory(TEST_FOLDER):
 
-    results = searchSimilaritems(query)
+        # 3. Now you can run searches on that folder.
+        query = "a dog playing in a park"
+        print(f"Searching for: '{query}'")
 
-    if results:
-        print(f"Found {len(results)} matching images:")
-        for filename in results:
-            print(f"- {filename}")
+        results = searchSimilaritems(query)
+
+        if results:
+            print(f"Found {len(results)} matching images:")
+            for filename in results:
+                print(f"- {filename}")
+        else:
+            print("No similar images found.")
+
     else:
-        print("No similar images found.")
+        print(f"Could not load folder {TEST_FOLDER} to run search.")
